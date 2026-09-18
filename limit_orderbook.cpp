@@ -19,6 +19,17 @@ enum class OrderAttributes {
     FULFILL_ALL
 };
 
+struct Party {
+    OrderId id;
+    Quantity quantity;
+    Price price;
+};
+
+struct Transaction {
+    std::vector<Party> buyers, sellers;
+    Price bid_ask_spread;
+};
+
 struct Order {
     OrderId id;
     Side side;
@@ -121,44 +132,46 @@ public:
         order_map.clear();
     }
 
-    void process_order(OrderId id, Side side, Price price, Quantity qty, OrderAttributes attr = OrderAttributes::DEFAULT) {
+    Transaction process_order(OrderId id, Side side, Price price, Quantity qty, OrderAttributes attr = OrderAttributes::DEFAULT) {
         auto& match_map = (side == Side::BUY) ? asks : bids; // buy orders match with asks; sell orders mask with bids
         if (match_map.empty()) { // no opposing liquidity, shelve the order
             add_to_book(id, side, price, qty, attr);
-            return;
+            return Transaction();
         }
         auto top_match_level = (side == Side::BUY) ? std::prev(match_map.end()) : match_map.begin(); // reverse iteration for buy (lowest seller), forward for sell (highest buyer)
 
         // count total fulfillable volume
+        Transaction trades; // track using Transactions
+        auto& this_side = (side == Side::BUY) ? trades.buyers : trades.sellers;
+        auto& other_side = (side == Side::BUY) ? trades.sellers : trades.buyers;
+        this_side.push_back(Party{id, qty, price});
         auto iter = top_match_level;
         Quantity total_volume = 0;
         uint64_t remaining = match_map.size();
         while (remaining-- > 0) {
-            if ((side == Side::BUY) ? ((*iter).first > price) : ((*iter).first < price)) { // all further orders are outside the acceptable range
+            PriceLevel& level = (*iter).second;
+            (side == Side::BUY) ? (--iter) : (++iter);
+            if ((side == Side::BUY) ? (level.price > price) : (level.price < price)) { // all further orders are outside the acceptable range
                 break;
             }
 
-            /*
-            Order* order = (*iter).second.head;
-            while (order != nullptr) { // a partial order can only contribute to the total available volume if it is not FULFILL_ALL
-                Quantity new_qty = order -> quantity;
-                if (total_volume + new_qty <= qty || order -> attributes == OrderAttributes::DEFAULT) {
-                    total_volume += new_qty;
+            // otherwise, we continue
+            // iterate through the PriceLevel- must do this anyway to get the order quantities
+            Order* order = level.head;
+            while (order != nullptr) {
+                if (total_volume + order -> quantity <= qty) { // execute full
+                    other_side.push_back(Party{order -> id, order -> quantity, order -> price});
+                    total_volume += order -> quantity;
+                } else { // execute partial
+                    other_side.push_back(Party{order -> id, qty - total_volume, order -> price});
+                    total_volume = qty;
+                    break; // done fulfilling
                 }
                 order = order -> next;
-                if (total_volume >= qty) {
-                    break;
-                }
             }
-            */
-            // the above logic is not necessary because unfulfillable FULFILL_ALL orders are automatically dropped, so all LOB orders are DEFAULT
-            
-            // simply query PriceLevel total volume
-            total_volume += (*iter).second.total_volume;
-            if (total_volume >= qty) { 
+            if (total_volume >= qty) {
                 break;
             }
-            (side == Side::BUY) ? (--iter) : (++iter);
         }
 
         // order fulfilment/insertion logic
@@ -166,49 +179,19 @@ public:
             throw std::domain_error("Order could not be fulfilled with full volume at requested price.");
         }
         // otherwise, fulfill the order- either the order is DEFAULT, or total available volume is enough for FULFILL_ALL order, leaving zero unfulfilled volume
-        iter = top_match_level;
-        total_volume = 0;
-        remaining = match_map.size();
-        while (remaining-- > 0) {
-            PriceLevel& level = (*iter).second;
-            (side == Side::BUY) ? (--iter) : (++iter);
-            if ((side == Side::BUY) ? (level.price > price) : (level.price < price)) { // all further orders are outside the acceptable range
-                Quantity remaining_volume = qty - total_volume;
-                add_to_book(id, side, price, remaining_volume, attr);
-                return;
-            }
-            Quantity level_qty = level.total_volume;
-            if (total_volume + level_qty > qty) {
-                // this PriceLevel can finish order fulfilment- iterate linked list, fulfilling and dropping orders by priority
-                Order* order = level.head;
-                while (order != nullptr) {
-                    Quantity order_qty = order -> quantity;
-                    if (total_volume + order_qty > qty) { // this Order can finish order fulfilment- partial fulfillment leaving remainder of the order intact and we are done
-                        order -> quantity -= (qty - total_volume); // fulfilled
-                        level.total_volume -= (qty - total_volume);
-                        return;
-                    }
-                    // otherwise, fulfill the entire Order
-                    total_volume += order_qty;
-                    Order* next = order -> next;
-                    remove_from_book(order);
-                    order = next;
-                }
-                return;
-            }
-            // otherwise, fulfill the entire PriceLevel, drop its orders, and keep going
-            Order* order = level.head;
-            while (order != nullptr) {
-                Order* next = order -> next;
+        for (auto party : other_side) {
+            Order* order = order_map[party.id];
+            if (party.quantity == order -> quantity) { // this order was fulfilled. pop
                 remove_from_book(order);
-                order = next;
+            } else { // this order was not fulfilled. modify amount
+                order -> quantity -= party.quantity;
+                match_map[order -> price].total_volume -= party.quantity;
             }
-            total_volume += level_qty;
         }
-        Quantity remaining_volume = qty - total_volume;
-        if (remaining_volume > 0) {
-            add_to_book(id, side, price, remaining_volume, attr);
+        if (total_volume < qty) {
+            add_to_book(id, side, price, qty - total_volume, attr);
         }
+        return trades;
     }
 
     void cancel_order(OrderId id) {
