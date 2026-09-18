@@ -27,7 +27,9 @@ struct Party {
 
 struct Transaction {
     std::vector<Party> buyers, sellers;
-    Price bid_ask_spread;
+    operator bool() {
+        return !(buyers.empty() && sellers.empty()); // if (transaction) evaluates to false if both Party vectors are empty
+    }
 };
 
 struct Order {
@@ -52,8 +54,8 @@ struct PriceLevel {
     Order* head = nullptr;
     Order* tail = nullptr;
 
-    PriceLevel(Price price, Quantity vol, Order* head = nullptr, Order* tail = nullptr):
-        price(price), total_volume(vol), head(head), tail(tail) {}
+    PriceLevel(Price price, Quantity vol):
+        price(price), total_volume(vol), head(nullptr), tail(nullptr) {}
 
     void append_order(Order* order) { // add an order to the linkedlist
         total_volume += order -> quantity;
@@ -93,7 +95,7 @@ private:
         Order* order = new Order(id, side, price, qty, attr, nullptr, nullptr);
         order_map.emplace(id, order); // add to hashmap for constant-time search
         auto& target = (side == Side::BUY) ? bids : asks;
-        auto [iterator, inserted] = target.try_emplace(price, PriceLevel(price, 0, nullptr, nullptr)); // construct empty PriceLevel if DNE; otherwise do nothing
+        auto [iterator, inserted] = target.try_emplace(price, PriceLevel(price, 0)); // construct empty PriceLevel if DNE; otherwise do nothing
         iterator -> second.append_order(order); // add this order to a linked list corresponding to price ties
     }
 
@@ -144,13 +146,14 @@ public:
         Transaction trades; // track using Transactions
         auto& this_side = (side == Side::BUY) ? trades.buyers : trades.sellers;
         auto& other_side = (side == Side::BUY) ? trades.sellers : trades.buyers;
-        this_side.push_back(Party{id, qty, price});
         auto iter = top_match_level;
         Quantity total_volume = 0;
         uint64_t remaining = match_map.size();
         while (remaining-- > 0) {
             PriceLevel& level = (*iter).second;
-            (side == Side::BUY) ? (--iter) : (++iter);
+            if (remaining > 0) {
+                (side == Side::BUY) ? (--iter) : (++iter);
+            }
             if ((side == Side::BUY) ? (level.price > price) : (level.price < price)) { // all further orders are outside the acceptable range
                 break;
             }
@@ -175,19 +178,23 @@ public:
         }
 
         // order fulfilment/insertion logic
-        if (attr == OrderAttributes::FULFILL_ALL && total_volume < qty) { // order cannot be fulfilled. all or nothing -> nothing. reject and throw an exception
-            throw std::domain_error("Order could not be fulfilled with full volume at requested price.");
+        if (attr == OrderAttributes::FULFILL_ALL && total_volume < qty) { // order cannot be fulfilled. all or nothing -> nothing. reject and return empty Transaction
+            return Transaction();
         }
         // otherwise, fulfill the order- either the order is DEFAULT, or total available volume is enough for FULFILL_ALL order, leaving zero unfulfilled volume
         for (auto party : other_side) {
-            Order* order = order_map[party.id];
+            Order* order = order_map.at(party.id);
             if (party.quantity == order -> quantity) { // this order was fulfilled. pop
                 remove_from_book(order);
             } else { // this order was not fulfilled. modify amount
                 order -> quantity -= party.quantity;
-                match_map[order -> price].total_volume -= party.quantity;
+                match_map.at(order -> price).total_volume -= party.quantity;
             }
         }
+        if (total_volume > 0) {
+            this_side.push_back(Party{id, total_volume, price}); // log a valid transaction only if something was transacted (0 doesn't count)
+        }
+        // push the rest to LOB
         if (total_volume < qty) {
             add_to_book(id, side, price, qty - total_volume, attr);
         }
@@ -227,7 +234,7 @@ public:
             throw std::logic_error("This should not have happened."); // should theoretically never happen in a consistent book
         }
 
-        PriceLevel& level = level_it->second;
+        PriceLevel& level = level_it -> second;
         if (new_qty < order.quantity) { // maintain time priority
             Quantity diff = order.quantity - new_qty;
             order.quantity = new_qty;
