@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <map>
 
+// TODO: give each Order a PriceLevel* attribute to save expensive lookups and boilerplate code
+
 using OrderId = uint64_t;
 using Price = uint64_t;
 using Quantity = uint64_t;
@@ -91,12 +93,17 @@ private:
     std::map<Price, PriceLevel, std::greater<Price>> asks; // reverse iterator
 
     
-    void add_to_book(OrderId id, Side side, Price price, Quantity qty, OrderAttributes attr) {
+    bool add_to_book(OrderId id, Side side, Price price, Quantity qty, OrderAttributes attr) {
+        if (order_map.find(id) != order_map.end()) { // the order already exists- modify it?
+            modify_order(id, qty);
+            return false;
+        }
         Order* order = new Order(id, side, price, qty, attr, nullptr, nullptr);
         order_map.emplace(id, order); // add to hashmap for constant-time search
         auto& target = (side == Side::BUY) ? bids : asks;
-        auto [iterator, inserted] = target.try_emplace(price, PriceLevel(price, 0)); // construct empty PriceLevel if DNE; otherwise do nothing
+        auto [iterator, inserted] = target.try_emplace(price, price, 0); // construct empty PriceLevel if DNE; otherwise do nothing
         iterator -> second.append_order(order); // add this order to a linked list corresponding to price ties
+        return true;
     }
 
     void remove_from_book(Order* order) {
@@ -128,16 +135,22 @@ public:
 
     ~LimitOrderBook() {
         // safely delete all allocated Order pointers
-        for (auto [id, order] : order_map) {
+        for (auto& [id, order] : order_map) {
             delete order;
         }
         order_map.clear();
     }
 
     Transaction process_order(OrderId id, Side side, Price price, Quantity qty, OrderAttributes attr = OrderAttributes::DEFAULT) {
+        if (qty == 0) { // input validation
+            return Transaction();
+        }
         auto& match_map = (side == Side::BUY) ? asks : bids; // buy orders match with asks; sell orders mask with bids
-        if (match_map.empty()) { // no opposing liquidity, shelve the order
-            add_to_book(id, side, price, qty, attr);
+        if (match_map.empty()) { // no opposing liquidity
+            if (attr == OrderAttributes::FULFILL_ALL) { // can't fulfill, return empty
+                return Transaction();
+            }
+            add_to_book(id, side, price, qty, attr); // if it is a DEFAULT order, shelve it
             return Transaction();
         }
         auto top_match_level = (side == Side::BUY) ? std::prev(match_map.end()) : match_map.begin(); // reverse iteration for buy (lowest seller), forward for sell (highest buyer)
@@ -161,7 +174,7 @@ public:
             // otherwise, we continue
             // iterate through the PriceLevel- must do this anyway to get the order quantities
             Order* order = level.head;
-            while (order != nullptr) {
+            while (order != nullptr && total_volume < qty) {
                 if (total_volume + order -> quantity <= qty) { // execute full
                     other_side.push_back(Party{order -> id, order -> quantity, order -> price});
                     total_volume += order -> quantity;
@@ -182,7 +195,7 @@ public:
             return Transaction();
         }
         // otherwise, fulfill the order- either the order is DEFAULT, or total available volume is enough for FULFILL_ALL order, leaving zero unfulfilled volume
-        for (auto party : other_side) {
+        for (auto& party : other_side) {
             Order* order = order_map.at(party.id);
             if (party.quantity == order -> quantity) { // this order was fulfilled. pop
                 remove_from_book(order);
@@ -201,55 +214,48 @@ public:
         return trades;
     }
 
-    void cancel_order(OrderId id) {
+    bool cancel_order(OrderId id) {
         auto loc = order_map.find(id);
         if (loc == order_map.end()) {
-            throw std::domain_error("This order ID does not exist.");
+            return false;
         }
         remove_from_book((*loc).second);
-        return;
+        return true;
     }
 
-    /**
-     * @brief Modifies the quantity of an existing order.
-     * 
-     * Rule: If quantity decreases, it keeps its place in the time queue.
-     * If quantity increases, it loses its time priority and moves to the back (tail).
-     * 
-     * @param id The OrderId to modify
-     * @param new_qty The new desired quantity
-     */
-    void modify_order(OrderId id, Quantity new_qty) {
+    bool modify_order(OrderId id, Quantity new_qty) {
+        if (new_qty == 0) {
+            cancel_order(id);
+            return true;
+        }
         auto it = order_map.find(id);
         if (it == order_map.end()) {
-            throw std::domain_error("This order ID does not exist.");
+            return false;
         }
         Order& order = *(it -> second);
-        if (new_qty == order.quantity) {
-            return; // no change needed
+        if (new_qty == order.quantity) { // no change needed- redundant
+            return true;
         }
         auto& book = (order.side == Side::BUY) ? bids : asks;
         auto level_it = book.find(order.price);
-        if (level_it == book.end()) {
-            throw std::logic_error("This should not have happened."); // should theoretically never happen in a consistent book
-        }
 
         PriceLevel& level = level_it -> second;
-        if (new_qty < order.quantity) { // maintain time priority
+        if (new_qty < order.quantity) { // maintain time priority and update quantity
             Quantity diff = order.quantity - new_qty;
             order.quantity = new_qty;
             level.total_volume -= diff;
         } else { // lose time priority (move to back of list)
-            if (level.tail == &order) {
+            if (level.tail == &order) { // already at tail- no reordering needed
                 Quantity diff = new_qty - order.quantity;
                 order.quantity = new_qty;
                 level.total_volume += diff;
-            } else {
+            } else { // needs reordering
                 level.remove_order(&order); // this one doesn't use delete so it's fine to keep using order ptr
                 order.quantity = new_qty;
                 level.append_order(&order); // reattach at the end
             }
         }
+        return true;
     }
 
 
